@@ -8,7 +8,7 @@
 #include <cmath>
 
 // bump if necessary
-#define LLAMA_MAX_LAYERS  512
+#define LLAMA_MAX_LAYERS  4096
 #define LLAMA_MAX_EXPERTS 1024 // Kimi K3
 #define LLAMA_MAX_PLE_NGRAM 8  // qwen4exp
 #define LLAMA_MAX_PLE_HEADS 64 // qwen4exp

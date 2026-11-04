@@ -27,7 +27,7 @@ void llama_model_dory::load_arch_hparams(llama_model_loader & ml) {
 
     const uint64_t n_physical = uint64_t(n_input) + n_recurrent + n_output;
     const uint64_t n_virtual = uint64_t(n_input) + uint64_t(n_recurrent)*n_loops + n_output;
-    if (!n_input || !n_recurrent || !n_output || !n_loops || n_loops > 4 ||
+    if (!n_input || !n_recurrent || !n_output || !n_loops || n_loops > 256 ||
             n_virtual > LLAMA_MAX_LAYERS || n_physical != hparams.n_layer_all ||
             pattern.size() != n_physical || profile.size() != n_physical ||
             pattern.find_first_not_of("S*-") != std::string::npos ||

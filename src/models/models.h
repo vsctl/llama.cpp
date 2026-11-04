@@ -163,6 +163,10 @@ struct llama_model_dory : public llama_model_base {
     };
     std::vector<scales> scale;
     ggml_tensor * logit_scale = nullptr;
+    // RoPE base for the physical layer p: profile 2 -> theta_2, profile 1 -> theta_1
+    float get_dory_rope_freq_base(uint32_t p) const {
+        return profile[p] == 2 ? theta_2 : theta_1;
+    }
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
     struct graph : public llm_graph_context {

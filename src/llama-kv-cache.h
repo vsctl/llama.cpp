@@ -161,6 +161,8 @@ public:
 
     bool get_has_shift() const;
 
+    ggml_cgraph * build_graph_shift_dory(llm_graph_result * res, llama_context * lctx) const;
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 

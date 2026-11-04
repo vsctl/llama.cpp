@@ -47,7 +47,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
            llama_memory_t   mem_other,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
-    const  layer_share_cb & share) : unified(unified) {
+    const  layer_share_cb & share) : unified(unified), model(model) {
 
     // chain filters
     const layer_filter_cb filter_base = [&](int32_t il) {
@@ -251,9 +251,16 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_update(llama_context * lctx, 
 }
 
 bool llama_kv_cache_iswa::get_can_shift() const {
-    return kv_base->get_can_shift() &&
-           kv_swa->get_can_shift() &&
-           kv_base->get_size() == kv_swa->get_size();
+    if (!kv_base->get_can_shift() || !kv_swa->get_can_shift()) {
+        return false;
+    }
+    // The base and SWA sub-caches shift independently (each re-rotates only its own layers),
+    // so matching sizes are not required. Dory splits into base (*) and SWA (S) layers and its
+    // sub-caches are sized differently by design, so skip the size check for it.
+    if (model.arch == LLM_ARCH_DORY) {
+        return true;
+    }
+    return kv_base->get_size() == kv_swa->get_size();
 }
 
 void llama_kv_cache_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {

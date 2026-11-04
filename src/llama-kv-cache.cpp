@@ -4,6 +4,7 @@
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "models/models.h"
 
 #include <algorithm>
 #include <cassert>
@@ -1206,10 +1207,6 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 }
 
 bool llama_kv_cache::get_can_shift() const {
-    // Dory uses physical-layer RoPE profiles and post-RoPE normalization.
-    if (model.arch == LLM_ARCH_DORY) {
-        return false;
-    }
     // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.
     if (model.arch == LLM_ARCH_STEP35) {
         return false;
@@ -2021,6 +2018,12 @@ void llm_graph_input_k_shift::set_input(const llama_ubatch * ubatch) {
 }
 
 ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_context * lctx) const {
+    // Dory caches baked keys (rotated + normalized per physical-layer RoPE profile).
+    // The generic shift re-rotates the cache with the wrong per-layer base and
+    // double-rotates, so it needs its own graph.
+    if (model.arch == LLM_ARCH_DORY) {
+        return build_graph_shift_dory(res, lctx);
+    }
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     GGML_ASSERT(!other);
 
@@ -2068,6 +2071,84 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
     }
 
     res->add_input(std::move(inp));
+
+    return gf;
+}
+
+ggml_cgraph * llama_kv_cache::build_graph_shift_dory(llm_graph_result * res, llama_context * lctx) const {
+    GGML_ASSERT(!other);
+
+    auto * ctx = res->get_ctx();
+    auto * gf  = res->get_gf();
+
+    const auto & cparams = lctx->get_cparams();
+    const auto & dory    = static_cast<const llama_model_dory &>(model);
+
+    // rope_ext evaluates R(theta, pos) directly at the position in the b vector (no n_past
+    // offset in the forward path), so to move the key cached in slot i (baked at position i)
+    // to its new slot i + shift we must re-bake it at absolute position i + shift. The shift
+    // is exactly the value the generic path writes via set_input_k_shift, read here the same way.
+    ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) get_size()*n_stream);
+    ggml_set_name(pos, "dory_shift_pos");
+    {
+        int32_t * data = (int32_t *) pos->data;
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            const auto & cells = v_cells[s];
+            for (uint32_t i = 0; i < cells.size(); ++i) {
+                data[s*cells.size() + i] = cells.is_empty(i) ? 0 : (int32_t) (i + cells.get_shift(i));
+            }
+        }
+    }
+
+    const int64_t ne0 = hparams.n_embd_head_k(0); // == n_rot for Dory (no NOPE dims)
+
+    // Dory K/V are stored transposed: [n_embd_head_k, n_head_kv, n_slots]
+    for (const auto & layer : layers) {
+        const uint32_t il = layer.il;
+
+        if (hparams.n_head_kv(il) == 0) {
+            continue; // non-attention (MLP) physical layer
+        }
+        if (!hparams.rope_pattern[il]) {
+            continue; // profile == 0: never rotated, nothing to shift
+        }
+
+        const uint32_t  p         = dory.physical[il];
+        const float     theta     = dory.get_dory_rope_freq_base(p);
+        const int64_t   n_head_kv = hparams.n_head_kv(il);
+
+        // [ne0, n_head_kv, n_slots] -> [n_head_kv, ne0, n_slots] (rows = per-head vector, like k_cur).
+        // a transpose swaps the two inner dims, so the transposed row stride is the old row size
+        // (ne0*ts) and the per-row stride is the old column stride (ts).
+        const int64_t ts = ggml_row_size(layer.k->type, 1);
+        ggml_tensor * k = ggml_transpose(ctx, ggml_view_3d(ctx, layer.k,
+                ne0, n_head_kv, get_size()*n_stream,
+                ts,
+                ne0*ts,
+                0));
+
+        // dequantize if the cache is quantized (rotation is exact in f32)
+        if (ggml_is_quantized(k->type)) {
+            k = ggml_cast(ctx, k, GGML_TYPE_F32);
+        }
+
+        // The cache holds k = normalize(R(theta, pos). k0). Both R and normalize are
+        // position-independent, so the shift is a pure rotation of k:
+        //   k' = R(theta, pos). R(theta, pos)^T . k
+        // no renormalization is needed (R is orthogonal, so it preserves the norm the
+        // forward graph already applied).
+        ggml_tensor * k0 = ggml_rope_ext_back(ctx, k, pos, nullptr, ne0, hparams.rope_type,
+                cparams.n_ctx_orig_yarn, theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        ggml_tensor * kn = ggml_rope_ext(ctx, k0, pos, nullptr, ne0, hparams.rope_type,
+                cparams.n_ctx_orig_yarn, theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+
+        if (ggml_is_quantized(layer.k->type)) {
+            kn = ggml_cast(ctx, kn, layer.k->type);
+        }
+
+        // write back to the transposed storage [ne0, n_head_kv, n_slots]
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_transpose(ctx, kn), layer.k));
+    }
 
     return gf;
 }

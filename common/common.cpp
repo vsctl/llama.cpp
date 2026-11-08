@@ -1653,6 +1653,10 @@ void common_memory::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, lla
     }
 }
 
+bool common_memory::can_shift_media() const {
+    return llama_memory_can_shift_media(llama_get_memory(ctx_tgt));
+}
+
 void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora) {
     std::vector<llama_adapter_lora *> loras;
     std::vector<float> scales;

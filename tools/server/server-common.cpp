@@ -539,6 +539,47 @@ std::pair<const mtmd::input_chunk_ptr *, size_t> server_tokens::find_next_media_
     return { nullptr, 0 };
 }
 
+size_t server_tokens::find_media_match(const char * id, size_t n_tokens, size_t from_idx) const {
+    // walk the media chunks in index order starting at/after from_idx; return
+    // the first whose (id, n_tokens) match. id == nullptr matches any id.
+    for (auto it = map_idx_to_media.lower_bound(from_idx); it != map_idx_to_media.end(); ++it) {
+        const auto * chunk = it->second.get();
+        if (mtmd_input_chunk_get_n_tokens(chunk) != n_tokens) {
+            continue;
+        }
+        if (id != nullptr) {
+            // compare the id *strings* (not pointers); id == nullptr means
+            // "match any id", handled by the caller passing nullptr.
+            const char * c_id = mtmd_input_chunk_get_id(chunk);
+            if (strcmp(c_id, id) != 0) {
+                continue;
+            }
+        }
+        return it->first;
+    }
+    return (size_t) -1;
+}
+
+bool server_tokens::has_media_chunk_at(size_t idx) const {
+    return map_idx_to_media.count(idx) > 0;
+}
+
+bool server_tokens::has_media_in_range(size_t i0, size_t i1) const {
+    if (!has_mtmd || i0 >= i1) {
+        return false;
+    }
+    // a chunk occupies [start, start + n_tokens); it overlaps [i0, i1) iff
+    // start < i1 && start + n_tokens > i0
+    for (const auto & kv : map_idx_to_media) {
+        const size_t start = kv.first;
+        const size_t end   = start + mtmd_input_chunk_get_n_tokens(kv.second.get());
+        if (start < i1 && end > i0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void server_tokens::push_back(llama_token tok) {
     if (tok == LLAMA_TOKEN_NULL) {
         throw std::runtime_error("Invalid token");

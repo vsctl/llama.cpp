@@ -206,6 +206,19 @@ public:
     // returns a pair of pointer to the chunk (nullptr if not found) and its start index in tokens
     std::pair<const mtmd::input_chunk_ptr *, size_t> find_next_media_chunk(size_t idx) const;
 
+    // find a media chunk whose (id, n_tokens) match, at or after from_idx.
+    // returns the chunk start index, or size_t(-1) if none.
+    // id == nullptr matches any id (useful when chunks carry no id, e.g. the
+    // server sets no bitmap id); n_tokens must match exactly.
+    size_t find_media_match(const char * id, size_t n_tokens, size_t from_idx) const;
+
+    // true if idx is the start of a media chunk (has a media chunk mapped here)
+    bool has_media_chunk_at(size_t idx) const;
+
+    // true if any media chunk has a token inside [i0, i1)
+    // a chunk that starts before i0 but spans into the range also counts
+    bool has_media_in_range(size_t i0, size_t i1) const;
+
     void push_back(llama_token tok);
 
     // will create a copy of the chunk if it contains non-text data

@@ -100,6 +100,12 @@ struct llama_memory_i {
     // getters
     virtual bool get_can_shift() const = 0;
 
+    // true if this memory can shift a matched run that crosses a media (M-RoPE)
+    // chunk. Default false: only llama_kv_cache (Qwen I-M-RoPE / M-RoPE, where
+    // section 3 = 0) overrides this. Other memory types keep the recompute
+    // fallback for media runs.
+    virtual bool can_shift_media() const { return false; }
+
     //
     // ops
     //

@@ -593,7 +593,12 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
     }
 
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
-    GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_add() is only supported for n_pos_per_embd() == 1");
+    // n_pos_per_embd() == 1 is the scalar (text-only) case. M-RoPE / I-M-RoPE
+    // (n_pos_per_embd() > 1) is allowed here: build_graph_shift_imrope re-bakes
+    // each key from its stored baked position (cells.pos + cells.ext.{x,y}) so a
+    // scalar shift moves the whole 4-section M-RoPE position. The server only
+    // routes a run that crosses a media chunk here when section 3 (z) is 0
+    // (Qwen I-M-RoPE); any model where z != 0 falls back to recompute.
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
     auto & head  = v_heads[seq_to_stream[seq_id]];
@@ -1211,10 +1216,23 @@ bool llama_kv_cache::get_can_shift() const {
     if (model.arch == LLM_ARCH_STEP35) {
         return false;
     }
-    if (hparams.n_pos_per_embd() > 1) {
+    // M-RoPE / I-M-RoPE (n_pos_per_embd() > 1): a *text* token maps to one
+    // scalar position (all pos sections equal), so its KV shifts exactly. Media
+    // tokens use the full 4-section M-RoPE position, which build_graph_shift_imrope
+    // re-bakes from the stored (cells.pos, cells.ext.{x,y}) when section 3 (z)
+    // is 0. Return true so both text and (eligible) media runs can be reused.
+    return true;
+}
+
+bool llama_kv_cache::can_shift_media() const {
+    // only meaningful for M-RoPE / I-M-RoPE; other rope types have no media
+    if (hparams.rope_type != LLAMA_ROPE_TYPE_MROPE &&
+        hparams.rope_type != LLAMA_ROPE_TYPE_IMROPE) {
         return false;
     }
-    return true;
+    // section 3 (z) must be 0 for a scalar shift to re-bake the full position.
+    // Qwen I-M-RoPE / M-RoPE satisfy this; HunyuanVL (z = image_idx) does not.
+    return hparams.rope_sections[3] == 0;
 }
 
 uint32_t llama_kv_cache::get_size() const {
@@ -2024,6 +2042,14 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
     if (model.arch == LLM_ARCH_DORY) {
         return build_graph_shift_dory(res, lctx);
     }
+    // M-RoPE / I-M-RoPE: a text token is rotated only in the temporal sector
+    // (h/w sections are baked with pos=0 = identity). The generic NEoX shift
+    // would rotate all dims and corrupt the h/w sector, so it needs its own
+    // graph that re-bakes only the temporal position. Media runs are guarded
+    // at the server (never shifted).
+    if (hparams.rope_type == LLAMA_ROPE_TYPE_MROPE || hparams.rope_type == LLAMA_ROPE_TYPE_IMROPE) {
+        return build_graph_shift_imrope(res, lctx);
+    }
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     GGML_ASSERT(!other);
 
@@ -2148,6 +2174,128 @@ ggml_cgraph * llama_kv_cache::build_graph_shift_dory(llm_graph_result * res, lla
 
         // write back to the transposed storage [ne0, n_head_kv, n_slots]
         ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_transpose(ctx, kn), layer.k));
+    }
+
+    return gf;
+}
+
+ggml_cgraph * llama_kv_cache::build_graph_shift_imrope(llm_graph_result * res, llama_context * lctx) const {
+    GGML_ASSERT(!other);
+
+    auto * ctx = res->get_ctx();
+    auto * gf  = res->get_gf();
+
+    const auto & cparams = lctx->get_cparams();
+
+    // I-M-RoPE / M-RoPE: re-bake each cached key from the position it was
+    // originally baked with (pos_old) to its new position (pos_new). The KV
+    // cache stores the baked position per cell:
+    //   cells.pos[i]  = section 0 (temporal)
+    //   cells.ext.x   = section 1 (x / horizontal)
+    //   cells.ext.y   = section 2 (y / vertical)
+    //   section 3 (z) is NOT stored; it is 0 for Qwen I-M-RoPE (the only
+    //   supported media model) and is guarded off at the server for any model
+    //   where z != 0.
+    // For a *text* token the baked position is (i,0,0,0), so this reduces to
+    //   k' = rope_multi_fwd({i+shift,0,0,0}) . rope_multi_back({i,0,0,0}) . k
+    // For a *media* token (M-RoPE) the baked position is the full 4-section
+    // grid (t,x,y,0) and all four sections advance by the same scalar shift,
+    // preserving the image's internal grid. Either way the same graph applies:
+    //   pos_new[j] = pos_old[j] + shift   (j in 0..3)
+    // The server guarantees a matched run that crosses a media chunk only
+    // reaches here when z == 0 (otherwise it falls back to recompute).
+    const int64_t n_slots = get_size()*n_stream;
+
+    // two 4-section pos tensors, section-major: pos[j*n_slots + i], j in 0..3
+    ggml_tensor * pos_old = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4*n_slots);
+    ggml_set_name(pos_old, "imrope_shift_pos_old");
+    ggml_tensor * pos_new = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4*n_slots);
+    ggml_set_name(pos_new, "imrope_shift_pos_new");
+    {
+        int32_t * d_old = (int32_t *) pos_old->data;
+        int32_t * d_new = (int32_t *) pos_new->data;
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            const auto & cells = v_cells[s];
+            for (uint32_t i = 0; i < cells.size(); ++i) {
+                const bool   empty = cells.is_empty(i);
+                const int32_t sh   = empty ? 0 : (int32_t) cells.get_shift(i);
+                const int64_t base = (int64_t) s*cells.size() + i;
+                // section-major: base+0 = t, base+1 = x, base+2 = y, base+3 = z(=0)
+                if (empty) {
+                    continue; // all sections zero-init
+                }
+                const llama_kv_cell_ext ext = cells.ext_get(i);
+                const int32_t t = (int32_t) cells.pos_get(i); // section 0
+                const int32_t x = (int32_t) ext.x;           // section 1
+                const int32_t y = (int32_t) ext.y;           // section 2
+                d_old[base + 0] = t;
+                d_old[base + 1] = x;
+                d_old[base + 2] = y;
+                d_old[base + 3] = 0;
+                d_new[base + 0] = t + sh;
+                d_new[base + 1] = x + sh;
+                d_new[base + 2] = y + sh;
+                d_new[base + 3] = 0;
+            }
+        }
+    }
+
+    int sections[GGML_MROPE_SECTIONS] = {
+        (int) hparams.rope_sections[0],
+        (int) hparams.rope_sections[1],
+        (int) hparams.rope_sections[2],
+        (int) hparams.rope_sections[3],
+    };
+
+    const int n_ctx_orig = cparams.n_ctx_orig_yarn;
+    const float ext_factor  = cparams.yarn_ext_factor;
+    const float attn_factor = cparams.yarn_attn_factor;
+    const float beta_fast   = cparams.yarn_beta_fast;
+    const float beta_slow   = cparams.yarn_beta_slow;
+
+    for (const auto & layer : layers) {
+        const uint32_t il = layer.il;
+
+        if (!hparams.has_rope(il)) {
+            continue;
+        }
+
+        const int64_t n_rot         = hparams.n_rot(il);
+        const int64_t n_head_kv     = hparams.n_head_kv(il);
+        const int64_t n_embd_k_gqa  = hparams.n_embd_k_gqa(il);
+        const int64_t n_embd_head_k = hparams.n_embd_head_k(il);
+        const int64_t n_embd_nope   = hparams.n_lora_kv > 0 ? n_embd_head_k - n_rot : 0;
+
+        const float freq_base_l  = model.get_rope_freq_base (cparams, il);
+        const float freq_scale_l = model.get_rope_freq_scale(cparams, il);
+
+        // K cache view [n_rot, n_head_kv, n_slots] (rows = per-head vector)
+        ggml_tensor * k =
+            ggml_view_3d(ctx, layer.k,
+                n_rot, n_head_kv, get_size()*n_stream,
+                ggml_row_size(layer.k->type, n_embd_head_k),
+                ggml_row_size(layer.k->type, n_embd_k_gqa),
+                ggml_row_size(layer.k->type, n_embd_nope));
+
+        // dequantize if the cache is quantized (rotation is exact in f32)
+        if (ggml_is_quantized(k->type)) {
+            k = ggml_cast(ctx, k, GGML_TYPE_F32);
+        }
+
+        // inverse at the original position, then forward at the new position
+        // (qwen35 forward passes nullptr as the freq_factors arg; match it)
+        ggml_tensor * k0 = ggml_rope_multi_back(ctx, k, pos_old, nullptr,
+                n_rot, sections, hparams.rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+        ggml_tensor * kn = ggml_rope_multi(ctx, k0, pos_new, nullptr,
+                n_rot, sections, hparams.rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+
+        if (ggml_is_quantized(layer.k->type)) {
+            kn = ggml_cast(ctx, kn, layer.k->type);
+        }
+
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, kn, layer.k));
     }
 
     return gf;

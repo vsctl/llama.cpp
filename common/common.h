@@ -1059,6 +1059,11 @@ struct common_memory {
     void seq_rm (llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
     void seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) const;
     void seq_cp (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) const;
+
+    // true if the target memory can shift a run that crosses a media (M-RoPE)
+    // chunk (Qwen I-M-RoPE / M-RoPE, section 3 = 0). Other models return false
+    // and keep the recompute fallback.
+    bool can_shift_media() const;
 };
 
 //

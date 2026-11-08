@@ -820,6 +820,11 @@ extern "C" {
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
+    // Check if the memory can shift a run that crosses a media (M-RoPE) chunk.
+    // True only for Qwen I-M-RoPE / M-RoPE (section 3 = 0); other models
+    // return false and keep the recompute fallback for media runs.
+    LLAMA_API bool llama_memory_can_shift_media(llama_memory_t mem);
+
     //
     // State / sessions
     //

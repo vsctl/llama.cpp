@@ -1309,10 +1309,13 @@ private:
                 SRV_WRN("%s\n", "ctx_shift is not supported by multimodal, it will be disabled");
             }
 
-            if (params_base.n_cache_reuse) {
-                params_base.n_cache_reuse = 0;
-                SRV_WRN("%s\n", "cache_reuse is not supported by multimodal, it will be disabled");
-            }
+            // cache_reuse IS supported for multimodal now: it re-rotates the
+            // text KV of matched prefixes, and (for models that can shift
+            // media, e.g. Qwen I-M-RoPE with section 3 = 0) also re-bakes a
+            // media run that moved position - see the per-run media check in
+            // the operator. ctx_shift stays off: a media chunk spans multiple
+            // positions, so the 1-pos-per-token shift invariant it relies on
+            // does not hold.
         }
 
         if (!llama_memory_can_shift(llama_get_memory(ctx_tgt))) {
@@ -3604,8 +3607,7 @@ private:
                                 const auto n_cache_reuse = slot.task->params.n_cache_reuse;
 
                                 const bool can_cache_reuse =
-                                    llama_memory_can_shift(llama_get_memory(ctx_tgt)) &&
-                                    !slot.prompt.tokens.has_mtmd;
+                                    llama_memory_can_shift(llama_get_memory(ctx_tgt));
 
                                 if (!can_cache_reuse && n_cache_reuse > 0) {
                                     SLT_WRN(slot, "cache reuse is not supported - ignoring n_cache_reuse = %d\n", n_cache_reuse);
@@ -3613,20 +3615,70 @@ private:
 
                                 // reuse chunks from the cached prompt by shifting their KV cache in the new position
                                 if (can_cache_reuse && n_cache_reuse > 0) {
-                                    GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
+                                    // A run is reusable if it is media-free, or if the memory can shift a
+                                    // media run (Qwen I-M-RoPE / M-RoPE, where section 3 = 0). The shift
+                                    // graph (build_graph_shift_imrope) re-bakes each key from its stored
+                                    // baked position (cells.pos + cells.ext.{x,y}); for text that is the
+                                    // scalar (i,0,0,0), for media the full 4-section grid advanced by the
+                                    // same scalar shift. Models where section 3 != 0 (e.g. HunyuanVL)
+                                    // return false and keep the recompute fallback for media runs.
+                                    const bool can_shift_media = slot.mem.can_shift_media();
+                                    const bool mm = slot.prompt.tokens.has_mtmd;
 
                                     size_t head_c = n_past; // cache
                                     size_t head_p = n_past; // current prompt
-
-                                    if (mctx) {
-                                        // we should never reach this
-                                        GGML_ABORT("not supported by multimodal");
-                                    }
+                                    // cache media scan position: the i-th prompt media chunk is matched
+                                    // against the i-th unshifted cache media chunk (in index order), so
+                                    // sequential images pair in order. Starts at n_past (the LCP end):
+                                    // the LCP's images are at cache positions < n_past and are already
+                                    // cached correctly (delta = 0), so they must NOT be re-matched (doing
+                                    // so would shift a correctly-cached LCP image to a new position and
+                                    // corrupt it). Only cache images beyond the LCP (the ones that moved)
+                                    // are eligible for a shift.
+                                    size_t media_from_c = n_past;
 
                                     SLT_DBG(slot, "trying to reuse chunks with size > %d, n_past = %d\n", n_cache_reuse, n_past);
 
                                     while (head_c < slot.prompt.tokens.size() &&
                                            head_p < input_tokens.size()) {
+
+                                        // --- media-aware run shift (new) ---
+                                        // the diagonal text walk below cannot find a media run that moved
+                                        // by a non-zero offset (it freezes head_p and compares at the same
+                                        // k, so a moved image's NULL run never aligns at the window head).
+                                        // When the prompt's current fill position is the start of a media
+                                        // chunk and the memory can shift media, find the matching cache
+                                        // chunk by (id, n_tokens) and shift its KV by the positional delta.
+                                        // This is the path that makes a moved image reusable (Qwen I-M-RoPE
+                                        // / M-RoPE, where section 3 = 0). Models where section 3 != 0 keep
+                                        // the recompute fallback (can_shift_media is false).
+                                        if (mm && can_shift_media &&
+                                            input_tokens[head_p] == LLAMA_TOKEN_NULL &&
+                                            input_tokens.has_media_chunk_at(head_p)) {
+                                            const auto & p_chunk = input_tokens.find_chunk(head_p);
+                                            const char * p_id    = mtmd_input_chunk_get_id(p_chunk.get());
+                                            const size_t  n_media = mtmd_input_chunk_get_n_tokens(p_chunk.get());
+
+                                            const size_t C = slot.prompt.tokens.find_media_match(p_id, n_media, media_from_c);
+                                            if (C != (size_t) -1) {
+                                                const int64_t kv_shift = (int64_t) head_p - (int64_t) C;
+                                                SLT_DBG(slot, "cache reuse: shifting MEDIA run of %zu tokens by %ld (KV re-baked for M-RoPE)\n",
+                                                        n_media, (long) kv_shift);
+                                                slot.mem.seq_rm (slot.id, head_p, C);
+                                                slot.mem.seq_add(slot.id, C, C + n_media, kv_shift);
+                                                for (size_t i = 0; i < n_media; i++) {
+                                                    n_past++;
+                                                }
+                                                // advance past the shifted media; continue the text walk from
+                                                // after the shifted chunk in the cache so trailing text aligns.
+                                                media_from_c = C + n_media;
+                                                head_c = C + n_media;
+                                                head_p += n_media;
+                                                continue;
+                                            }
+                                            // no matching cache chunk: fall through to the recompute
+                                            // fallback (the diagonal walk skips the NULLs one at a time).
+                                        }
 
                                         size_t n_match = 0;
                                         while (head_c + n_match < slot.prompt.tokens.size() &&
@@ -3635,13 +3687,26 @@ private:
                                             n_match++;
                                         }
 
-                                        if (n_match >= (size_t) n_cache_reuse) {
+                                        // a matched run is reusable if it is media-free, or if the memory can
+                                        // shift a media run. A run that crosses a media chunk is only shifted
+                                        // when can_shift_media; otherwise it is skipped (recomputed) so a model
+                                        // whose M-RoPE section 3 != 0 keeps the prior behaviour.
+                                        const bool run_reusable = !mm ||
+                                            !slot.prompt.tokens.has_media_in_range(head_c, head_c + n_match) ||
+                                            can_shift_media;
+
+                                        if (n_match >= (size_t) n_cache_reuse && run_reusable) {
                                             SLT_TRC(slot, "reusing chunk with size %zu, shifting KV cache [%zu, %zu) -> [%zu, %zu)\n", n_match, head_c, head_c + n_match, head_p, head_p + n_match);
-                                            //for (size_t i = head_p; i < head_p + n_match; i++) {
-                                            //    SLT_DBG(slot, "cache token %3zu: %6d '%s'\n", i, prompt_tokens[i], common_token_to_piece(ctx_tgt, prompt_tokens[i]).c_str());
-                                            //}
 
                                             const int64_t kv_shift = (int64_t) head_p - (int64_t) head_c;
+
+                                            // marker for the media (M-RoPE) shift path: fires only when a run
+                                            // crossing a media chunk is actually shifted (Qwen I-M-RoPE / M-RoPE,
+                                            // section 3 = 0). At DBG so it does not spam the default log level.
+                                            if (mm && slot.prompt.tokens.has_media_in_range(head_c, head_c + n_match)) {
+                                                SLT_DBG(slot, "cache reuse: shifting MEDIA run of %zu tokens by %ld (KV re-baked for M-RoPE)\n",
+                                                        n_match, (long) kv_shift);
+                                            }
 
                                             slot.mem.seq_rm (slot.id, head_p, head_c);
                                             slot.mem.seq_add(slot.id, head_c, head_c + n_match, kv_shift);
@@ -3658,7 +3723,8 @@ private:
                                         }
                                     }
 
-                                    SLT_DBG(slot, "after context reuse, new n_past = %d\n", n_past);
+                                    SLT_DBG(slot, "after context reuse, new n_past = %d (cache_prompt = %d, n_cache_reuse = %d)\n",
+                                            n_past, (int) slot.task->params.cache_prompt, (int) n_cache_reuse);
                                 }
                             } else {
                                 // if we don't cache the prompt, we have to remove all previous tokens

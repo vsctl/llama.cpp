@@ -161,7 +161,14 @@ public:
 
     bool get_has_shift() const;
 
+    // true if this cache's M-RoPE section 3 (z) is always 0, so a scalar shift
+    // can re-bake a media run's full 4-section position from the stored
+    // (pos, ext.x, ext.y). Qwen I-M-RoPE / M-RoPE qualify; HunyuanVL (z =
+    // image_idx) does not and keeps the recompute fallback.
+    bool can_shift_media() const override;
+
     ggml_cgraph * build_graph_shift_dory(llm_graph_result * res, llama_context * lctx) const;
+    ggml_cgraph * build_graph_shift_imrope(llm_graph_result * res, llama_context * lctx) const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;

@@ -731,6 +731,15 @@ llama_tokens server_tokens::get_text_tokens() const {
 }
 
 void server_tokens::set_token(llama_pos pos, llama_token id) {
+    if (has_mtmd) {
+        // text token on an mm prompt: allowed unless it lands over a media (NULL) slot
+        GGML_ASSERT(id != LLAMA_TOKEN_NULL);
+        if (tokens[pos] == LLAMA_TOKEN_NULL) {
+            throw std::runtime_error("set_token: text token written over media slot");
+        }
+        tokens[pos] = id;
+        return;
+    }
     GGML_ASSERT(!has_mtmd); // only allow this if mtmd is disabled
     tokens[pos] = id;
 }
@@ -780,53 +789,42 @@ std::string server_tokens::detokenize(const llama_context * ctx, bool special) c
 }
 
 size_t server_tokens::get_common_prefix(const server_tokens & b) const {
-    const size_t max_idx = std::min(tokens.size(), b.tokens.size());
+    // the LCP is the common text prefix. Media tokens are skipped: the
+    // cache-reuse shift loop re-bakes the KV of moved media to its new
+    // position, so media does not constrain the LCP. Comparing media chunks
+    // by identity at the same index (the previous behaviour) gave a wrong LCP
+    // when media moved between turns, which misaligned the shift loop's
+    // diagonal walk and caused set_token to write a text token into a media
+    // slot.
+    //
+    // we walk both token lists, skipping media chunks (LLAMA_TOKEN_NULL) in
+    // either, and compare text tokens. the LCP is the index in the *new*
+    // prompt (b) where the text tokens first differ.
+    const size_t n_a = tokens.size();
+    const size_t n_b = b.tokens.size();
 
-    if (!has_mtmd) {
-        for (size_t i = 0; i < max_idx; ++i) {
-            if (tokens[i] == b.tokens[i]) {
-                continue;
-            }
+    size_t ia = 0, ib = 0;
+    while (ia < n_a && ib < n_b) {
+        const llama_token a = tokens[ia];
+        const llama_token bt = b.tokens[ib];
 
-            return i;
+        if (a == LLAMA_TOKEN_NULL) {
+            ia += mtmd_input_chunk_get_n_tokens(find_chunk(ia).get());
+            continue;
         }
-
-        return max_idx;
-    }
-
-    for (size_t i = 0; i < max_idx; ++i) {
-        const llama_token ai =   tokens[i];
-        const llama_token bi = b.tokens[i];
-
-        if (ai == LLAMA_TOKEN_NULL && bi == LLAMA_TOKEN_NULL) {
-            const auto & a_chunk =   find_chunk(i);
-            const auto & b_chunk = b.find_chunk(i);
-
-            GGML_ASSERT(a_chunk && b_chunk);
-
-            const std::string id_ai = mtmd_input_chunk_get_id(a_chunk.get());
-            const std::string id_bi = mtmd_input_chunk_get_id(b_chunk.get());
-
-            const size_t n_tok_a = mtmd_input_chunk_get_n_tokens(a_chunk.get());
-            const size_t n_tok_b = mtmd_input_chunk_get_n_tokens(b_chunk.get());
-
-            if (id_ai == id_bi && n_tok_a == n_tok_b) {
-                GGML_ASSERT(n_tok_a > 0 && "Invalid media chunk"); // should never happen
-                i += n_tok_a - 1; // will be +1 by the for loop
-                continue;
-            }
-
-            return i;
-        }
-
-        if (ai == bi) {
+        if (bt == LLAMA_TOKEN_NULL) {
+            ib += mtmd_input_chunk_get_n_tokens(b.find_chunk(ib).get());
             continue;
         }
 
-        return i;
+        if (a != bt) {
+            break;
+        }
+        ++ia;
+        ++ib;
     }
 
-    return max_idx; // all tokens are equal
+    return ib;
 }
 
 common_chat_msg_spans server_tokens::find_message_spans(const common_chat_msg_delimiters & delims) const {

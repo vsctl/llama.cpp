@@ -2269,10 +2269,18 @@ ggml_cgraph * llama_kv_cache::build_graph_shift_imrope(llm_graph_result * res, l
         const float freq_base_l  = model.get_rope_freq_base (cparams, il);
         const float freq_scale_l = model.get_rope_freq_scale(cparams, il);
 
-        // K cache view [n_rot, n_head_kv, n_slots] (rows = per-head vector)
+        // View the FULL head row [n_embd_head_k, n_head_kv, n_slots] so the rotated
+        // result copies back to layer.k (allocated [n_embd_k_gqa, ...]) 1:1. RoPE
+        // rotates only the first n_rot dims of the row; any trailing NOPE/extra dims
+        // (n_embd_head_k > n_rot) are untouched, mirroring build_rope_shift (which
+        // rotates only the first n_rot dims and passes the rest through). The n_offs
+        // arg tells ggml_rope_multi to rotate [n_offs, n_offs+n_rot) of each row and
+        // leave the remainder as copy. For a NOPE-free head (n_rot == n_embd_head_k)
+        // n_offs == 0 and the whole row rotates, as before.
+        const int64_t n_offs = n_embd_head_k - n_rot; // == 0 when the head has no NOPE dims
         ggml_tensor * k =
             ggml_view_3d(ctx, layer.k,
-                n_rot, n_head_kv, get_size()*n_stream,
+                n_embd_head_k, n_head_kv, get_size()*n_stream,
                 ggml_row_size(layer.k->type, n_embd_head_k),
                 ggml_row_size(layer.k->type, n_embd_k_gqa),
                 ggml_row_size(layer.k->type, n_embd_nope));
@@ -2290,6 +2298,12 @@ ggml_cgraph * llama_kv_cache::build_graph_shift_imrope(llm_graph_result * res, l
         ggml_tensor * kn = ggml_rope_multi(ctx, k0, pos_new, nullptr,
                 n_rot, sections, hparams.rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
                 ext_factor, attn_factor, beta_fast, beta_slow);
+
+        // rotate [n_offs, n_offs+n_rot) of each row; NOPE dims (n_offs > 0) copy through.
+        if (n_offs > 0) {
+            ggml_rope_set_offset(k0, (int) n_offs);
+            ggml_rope_set_offset(kn, (int) n_offs);
+        }
 
         if (ggml_is_quantized(layer.k->type)) {
             kn = ggml_cast(ctx, kn, layer.k->type);

@@ -3642,16 +3642,21 @@ private:
                                     while (head_c < slot.prompt.tokens.size() &&
                                            head_p < input_tokens.size()) {
 
-                                        // --- media-aware run shift (new) ---
-                                        // the diagonal text walk below cannot find a media run that moved
-                                        // by a non-zero offset (it freezes head_p and compares at the same
-                                        // k, so a moved image's NULL run never aligns at the window head).
-                                        // When the prompt's current fill position is the start of a media
-                                        // chunk and the memory can shift media, find the matching cache
-                                        // chunk by (id, n_tokens) and shift its KV by the positional delta.
-                                        // This is the path that makes a moved image reusable (Qwen I-M-RoPE
-                                        // / M-RoPE, where section 3 = 0). Models where section 3 != 0 keep
-                                        // the recompute fallback (can_shift_media is false).
+                                        // --- media-aware run shift ---
+                                        // A media chunk's KV cannot be shifted by the diagonal text walk below
+                                        // (its set_token loop copies text tokens; a media slot is
+                                        // LLAMA_TOKEN_NULL and set_token refuses to write one). Media runs are
+                                        // therefore handled here, by matching the prompt's media chunk to the
+                                        // cache's by (id, n_tokens) and re-baking the shifted KV (Qwen
+                                        // I-M-RoPE / M-RoPE, where section 3 = 0). Models where section 3 != 0
+                                        // (can_shift_media false) keep the recompute fallback.
+                                        //
+                                        // The fire condition is on the PROMPT head (not the cache head): after
+                                        // the LCP the prompt is the source of truth for *which* media chunks
+                                        // exist and *where* they moved to. If the prompt head is a media start,
+                                        // match it to a cache chunk and shift. This covers both directions:
+                                        //   delta > 0 : prompt moved the image earlier (trimmed preamble)
+                                        //   delta < 0 : prompt moved the image later / a new image displaced it
                                         if (mm && can_shift_media &&
                                             input_tokens[head_p] == LLAMA_TOKEN_NULL &&
                                             input_tokens.has_media_chunk_at(head_p)) {
@@ -3664,20 +3669,23 @@ private:
                                                 const int64_t kv_shift = (int64_t) head_p - (int64_t) C;
                                                 SLT_DBG(slot, "cache reuse: shifting MEDIA run of %zu tokens by %ld (KV re-baked for M-RoPE)\n",
                                                         n_media, (long) kv_shift);
-                                                slot.mem.seq_rm (slot.id, head_p, C);
+                                                slot.mem.seq_rm (slot.id, head_p, C); // drop destination cells (no-op if head_p <= C)
                                                 slot.mem.seq_add(slot.id, C, C + n_media, kv_shift);
                                                 for (size_t i = 0; i < n_media; i++) {
                                                     n_past++;
                                                 }
-                                                // advance past the shifted media; continue the text walk from
-                                                // after the shifted chunk in the cache so trailing text aligns.
+                                                // advance past the shifted media; continue the text walk
+                                                // from after the shifted chunk in the cache so trailing
+                                                // text aligns. head_c jumps to just past the media so the
+                                                // diagonal walk resumes on the text that follows.
                                                 media_from_c = C + n_media;
                                                 head_c = C + n_media;
                                                 head_p += n_media;
                                                 continue;
                                             }
-                                            // no matching cache chunk: fall through to the recompute
-                                            // fallback (the diagonal walk skips the NULLs one at a time).
+                                            // no matching cache chunk: the prompt media is not reusable;
+                                            // fall through to the recompute fallback (the diagonal walk
+                                            // skips the NULLs one at a time).
                                         }
 
                                         size_t n_match = 0;
@@ -3688,9 +3696,10 @@ private:
                                         }
 
                                         // a matched run is reusable if it is media-free, or if the memory can
-                                        // shift a media run. A run that crosses a media chunk is only shifted
-                                        // when can_shift_media; otherwise it is skipped (recomputed) so a model
-                                        // whose M-RoPE section 3 != 0 keeps the prior behaviour.
+                                        // shift a media run (Qwen I-M-RoPE / M-RoPE, where section 3 = 0). A
+                                        // run that crosses a media chunk is only shifted when can_shift_media;
+                                        // otherwise it is skipped (recomputed) so a model whose M-RoPE section
+                                        // 3 != 0 keeps the prior behaviour.
                                         const bool run_reusable = !mm ||
                                             !slot.prompt.tokens.has_media_in_range(head_c, head_c + n_match) ||
                                             can_shift_media;
@@ -3700,24 +3709,57 @@ private:
 
                                             const int64_t kv_shift = (int64_t) head_p - (int64_t) head_c;
 
-                                            // marker for the media (M-RoPE) shift path: fires only when a run
-                                            // crossing a media chunk is actually shifted (Qwen I-M-RoPE / M-RoPE,
-                                            // section 3 = 0). At DBG so it does not spam the default log level.
-                                            if (mm && slot.prompt.tokens.has_media_in_range(head_c, head_c + n_match)) {
-                                                SLT_DBG(slot, "cache reuse: shifting MEDIA run of %zu tokens by %ld (KV re-baked for M-RoPE)\n",
-                                                        n_match, (long) kv_shift);
+                                            // if the destination range [head_p, head_p+n) crosses a media
+                                            // chunk, shift each such chunk first (re-bake its KV to the new
+                                            // position). The text run shift below does not span a media
+                                            // chunk, so it does not re-shift them; the set_token loop only
+                                            // touches text slots. If the memory cannot shift media
+                                            // (can_shift_media false) the run is not reusable and is
+                                            // recomputed instead.
+                                            bool media_shifted = true;
+                                            if (mm && slot.prompt.tokens.has_media_in_range(head_p, head_p + n_match)) {
+                                                if (!can_shift_media) {
+                                                    media_shifted = false;
+                                                } else {
+                                                    size_t m = head_p;
+                                                    while (m < head_p + n_match &&
+                                                           slot.prompt.tokens.has_media_chunk_at(m)) {
+                                                        const auto & p_chunk = slot.prompt.tokens.find_chunk(m);
+                                                        const char * p_id    = mtmd_input_chunk_get_id(p_chunk.get());
+                                                        const size_t  n_media = mtmd_input_chunk_get_n_tokens(p_chunk.get());
+
+                                                        const size_t C = slot.prompt.tokens.find_media_match(p_id, n_media, media_from_c);
+                                                        if (C == (size_t) -1) {
+                                                            media_shifted = false;
+                                                            break;
+                                                        }
+                                                        // shift relative to the chunk's own cache match
+                                                        const int64_t m_shift = (int64_t) m - (int64_t) C;
+                                                        SLT_DBG(slot, "cache reuse: shifting MEDIA run of %zu tokens by %ld (KV re-baked for M-RoPE)\n",
+                                                                n_media, (long) m_shift);
+                                                        slot.mem.seq_rm (slot.id, m, C);
+                                                        slot.mem.seq_add(slot.id, C, C + n_media, m_shift);
+                                                        n_past += n_media;
+                                                        media_from_c = C + n_media;
+                                                        m += n_media;
+                                                    }
+                                                }
                                             }
 
-                                            slot.mem.seq_rm (slot.id, head_p, head_c);
-                                            slot.mem.seq_add(slot.id, head_c, head_c + n_match, kv_shift);
+                                            if (media_shifted) {
+                                                slot.mem.seq_rm (slot.id, head_p, head_c);
+                                                slot.mem.seq_add(slot.id, head_c, head_c + n_match, kv_shift);
 
-                                            for (size_t i = 0; i < n_match; i++) {
-                                                slot.prompt.tokens.set_token(head_p + i, slot.prompt.tokens[head_c + i]);
-                                                n_past++;
+                                                for (size_t i = 0; i < n_match; i++) {
+                                                    slot.prompt.tokens.set_token(head_p + i, slot.prompt.tokens[head_c + i]);
+                                                    n_past++;
+                                                }
+
+                                                head_c += n_match;
+                                                head_p += n_match;
+                                            } else {
+                                                head_c += 1;
                                             }
-
-                                            head_c += n_match;
-                                            head_p += n_match;
                                         } else {
                                             head_c += 1;
                                         }

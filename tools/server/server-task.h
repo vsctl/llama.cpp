@@ -658,7 +658,11 @@ struct server_prompt_cache_state {
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
-        this->limit_tokens = limit_tokens;
+        // when the size limit is unlimited (-1), the token limit is also
+        // unlimited: the RAM cache is bounded by system memory, not by the
+        // GPU context size. tying limit_tokens to n_ctx here caused premature
+        // eviction when multiple slots held conversations longer than n_ctx.
+        this->limit_tokens = (limit_size_mib < 0) ? 0 : limit_tokens;
     }
 
     std::list<server_prompt_cache_state> states;

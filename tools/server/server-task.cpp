@@ -1760,6 +1760,26 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
     }
 
+    // make room for the token limit too, so we don't serialize a state that
+    // update() will immediately evict. without this, a finite --cache-ram
+    // would still pay the full serialization cost for entries that are dropped
+    // on the next update() call.
+    if (limit_tokens > 0) {
+        const size_t n_tokens_new = prompt.tokens.size();
+        while (!states.empty() && n_tokens() + n_tokens_new > limit_tokens) {
+            SRV_WRN(" - making room for prompt cache entry (tokens: %zu + %zu > %zu), removing oldest entry (size = %.3f MiB)\n",
+                    n_tokens(), n_tokens_new, limit_tokens, states.front().size() / (1024.0 * 1024.0));
+
+            states.pop_front();
+        }
+
+        if (n_tokens() + n_tokens_new > limit_tokens) {
+            SRV_WRN(" - prompt of %zu tokens exceeds cache token limit %zu, skipping\n",
+                    n_tokens_new, limit_tokens);
+            return nullptr;
+        }
+    }
+
     std::vector<uint8_t> state_data_tgt;
     std::vector<uint8_t> state_data_dft;
 
